@@ -1,0 +1,15 @@
+// Google's mirror of Maven Central - avoids rate limits
+allprojects {
+    buildscript {
+        repositories {
+            maven { url 'https://maven-central.storage-download.googleapis.com/maven2/' }
+            google()
+            mavenCentral() // fallback
+        }
+    }
+    repositories {
+        maven { url 'https://maven-central.storage-download.googleapis.com/maven2/' }
+        google()
+        mavenCentral() // fallback
+    }
+}
