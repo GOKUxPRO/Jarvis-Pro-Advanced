@@ -23,10 +23,11 @@ jobs:
           packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
           log-accepted-android-sdk-licenses: false
 
+      # Gradle setup with version 8.9 and caching enabled
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: 8.6
+          gradle-version: '8.9'
           cache-read-only: false
 
       - name: Build Debug APK
