@@ -4,7 +4,6 @@ build/
 .kotlin/
 *.apk
 *.aab
-.github
 .git
 
 # Local machine settings
