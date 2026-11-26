@@ -164,3 +164,10 @@ object LocalServerManager {
         }, "qwen-health-poller").start()
     }
 }
+
+    private fun isTermuxReady(): Boolean {
+        return try {
+            val p = Runtime.getRuntime().exec("which termux-info")
+            p.waitFor() == 0
+        } catch (e: Exception) { false }
+    }
