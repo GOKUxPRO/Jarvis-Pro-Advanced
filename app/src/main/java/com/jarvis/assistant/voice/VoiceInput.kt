@@ -1,70 +1,84 @@
 package com.jarvis.assistant.voice
 
+import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
 import kotlin.math.max
 
-class VoiceInput {
+class VoiceInput(
+    private val context: Context,
+    var customWakePhrase: String = "hey jarvis",
+    var earlyAccept: Boolean = false,
+    var onMicProblem: (() -> Unit)? = null,
+    var cancelCommand: (() -> Unit)? = null,
+    var canTranscribe: Boolean = true,
+    var listenWhileSpeaking: Boolean = false,
+    var echoCancellation: Boolean = true,
+    var wakeEnabled: Boolean = true
+) {
     private val TAG = "VoiceInput"
+    
+    // JarvisService ને જે વેરિયેબલ્સ જોઈએ છે તે બધા પબ્લિક કરો
+    var isListening: Boolean = false
+        private set
+    var muted: Boolean = false
+    var partialText: String = ""
+    var level: Float = 0f
+    var listenForCommand: Boolean = false
+    var hasWakeWord: Boolean = false
+    var isStopCommand: Boolean = false
+
     private val sampleRate = 16000
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-    private var isListening = false
-    
-    // રીલ્સ ટ્રિગર અટકાવવા માટે Threshold વધાર્યો (0.25 થી 0.65)
-    private val wakeWordThreshold = 0.65f 
+    private var audioRecord: AudioRecord? = null
     private var lastTriggerTime = 0L
 
-    fun startListening(onAudioCaptured: (ShortArray) -> Unit, onWakeWordDetected: () -> Unit) {
+    // અગાઉનું માઇક ગેઇન અને બફર ફિક્સ અહીં ઉમેર્યું છે
+    fun start() {
+        if (isListening) return
         isListening = true
         
-        // FIX: Buffer Size મોટું કર્યું જેથી અવાજ વચ્ચે ગેપ ના પડે
         val minBuffer = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
-        val bufferSize = max(minBuffer * 2, 4096)
+        val bufferSize = max(minBuffer * 2, 4096) // Buffer Gap Fix
 
-        // FIX: MIC ને બદલે VOICE_RECOGNITION વાપર્યું જેથી બેકગ્રાઉન્ડ નોઈઝ ઓછો થાય
-        val audioRecord = AudioRecord(
+        audioRecord = AudioRecord(
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
             sampleRate, channelConfig, audioFormat, bufferSize
         )
 
         try {
-            audioRecord.startRecording()
+            audioRecord?.startRecording()
             val buffer = ShortArray(bufferSize)
-
-            while (isListening) {
-                val read = audioRecord.read(buffer, 0, buffer.size)
-                if (read > 0) {
-                    // સોફ્ટવેર ગેઇન લગાવો જેથી તમારો અવાજ મોટો થાય
-                    val gainedBuffer = MicGain.applyGain(buffer)
-                    
-                    // STT માટે ઓડિયો મોકલો
-                    onAudioCaptured(gainedBuffer)
-
-                    // Wake Word ડિટેક્શન લોજિક
-                    val rms = calculateRMS(gainedBuffer)
-                    val currentTime = System.currentTimeMillis()
-
-                    // જો અવાજ પૂરતો મોટો હોય (RMS > 1500) અને કૂલડાઉન પૂરું થયું હોય
-                    if (rms > 1500 && (currentTime - lastTriggerTime > 2000)) {
-                        // અહીં Sherpa-ONNX નું અસલી ચેક આવશે (અત્યારે સિમ્યુલેટેડ છે)
-                        val isWakeWord = checkSherpaModel(gainedBuffer)
+            
+            Thread {
+                while (isListening) {
+                    val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
+                    if (read > 0 && !muted) {
+                        // અવાજ મોટો કરવાનું લોજિક
+                        for (i in 0 until read) {
+                            buffer[i] = (buffer[i] * 2.5f).toInt().coerceIn(-32768, 32767).toShort()
+                        }
                         
-                        if (isWakeWord) {
-                            Log.i(TAG, "Wake Word Detected! RMS: $rms")
-                            lastTriggerTime = currentTime
-                            onWakeWordDetected()
+                        // Level અપડેટ કરો
+                        level = calculateRMS(buffer).toFloat()
+                        
+                        // Sherpa-ONNX Wake Word લોજિક (સિમ્યુલેટેડ)
+                        if (wakeEnabled && !listenForCommand) {
+                            val currentTime = System.currentTimeMillis()
+                            if (level > 1500 && (currentTime - lastTriggerTime > 2000)) {
+                                lastTriggerTime = currentTime
+                                hasWakeWord = true
+                            }
                         }
                     }
                 }
-            }
+            }.start()
         } catch (e: Exception) {
-            Log.e(TAG, "AudioRecord Error: ${e.message}")
-        } finally {
-            audioRecord.stop()
-            audioRecord.release()
+            Log.e(TAG, "Mic Error: ${e.message}")
+            onMicProblem?.invoke()
         }
     }
 
@@ -74,11 +88,12 @@ class VoiceInput {
         return kotlin.math.sqrt(sum / buffer.size)
     }
 
-    private fun checkSherpaModel(buffer: ShortArray): Boolean {
-        // TODO: અહીં તમારો Sherpa-ONNX નો કોડ આવશે.
-        // ઉદાહરણ: return sherpaKeywordSpotter.process(buffer) > wakeWordThreshold
-        return true 
+    fun stop() {
+        isListening = false
+        try {
+            audioRecord?.stop()
+            audioRecord?.release()
+        } catch (e: Exception) {}
+        audioRecord = null
     }
-
-    fun stopListening() { isListening = false }
 }
