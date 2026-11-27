@@ -1,0 +1,603 @@
+d# xingchi_proxy.py
+import json
+import logging
+import os
+import sys
+import time
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, AsyncGenerator, Dict, List, Optional
+
+import httpx
+import uvicorn
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+
+# ---------------------------------------------------------------------
+# Configuration Management (Read directly from config.json)
+# ---------------------------------------------------------------------
+CONFIG_FILE = Path(__file__).parent / "config.json"
+
+def load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        print(f"[ERROR] {CONFIG_FILE} not found! Please create config.json with your settings.")
+        sys.exit(1)
+
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data
+    except Exception as e:
+        print(f"[ERROR] Failed to read {CONFIG_FILE}: {e}")
+        sys.exit(1)
+
+CONFIG = load_config()
+UPSTREAM_BASE_URL = CONFIG.get("upstream_url", "https://api.xingchiapi.com/v1").rstrip("/")
+
+# OpenCode CLI fingerprint headers required by XingchiAPI
+OPENCODE_FINGERPRINT_HEADERS = {
+    "User-Agent": "opencode/2.3.2",
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+}
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("xingchi-bridge")
+
+def mask_key(key: str) -> str:
+    if not key or key == "YOUR_KEY":
+        return "[NOT SET]"
+    return f"{key[:4]}...{key[-4:]}" if len(key) > 8 else "****"
+
+# ---------------------------------------------------------------------
+# Thinking & Reasoning Conversion
+# ---------------------------------------------------------------------
+def extract_reasoning_effort(body: dict) -> str:
+    """Detects reasoning / thinking preferences from any client:
+       - OpenCode / Cline / Roo / Kilo / Cursor / Codex formats
+       - reasoning_effort, reasoningEffort, reasoning: {effort: ...}, thinking: {budget_tokens: ...}
+    """
+    for field in ("reasoning_effort", "reasoningEffort"):
+        val = body.get(field)
+        if isinstance(val, str) and val.strip():
+            v = val.strip().lower()
+            if v in {"high", "xhigh", "max", "maximum"}: return "high"
+            if v in {"medium", "med"}: return "medium"
+            if v in {"low", "min", "minimal"}: return "low"
+            if v in {"none", "off", "disabled", "0", "false"}: return "none"
+
+    reasoning_obj = body.get("reasoning")
+    if isinstance(reasoning_obj, dict):
+        effort = reasoning_obj.get("effort")
+        if isinstance(effort, str):
+            v = effort.strip().lower()
+            if v in {"high", "medium", "low", "none"}:
+                return v
+
+    thinking_obj = body.get("thinking")
+    if isinstance(thinking_obj, dict):
+        if thinking_obj.get("type") == "disabled":
+            return "none"
+        budget = thinking_obj.get("budget_tokens", 0)
+        if budget:
+            if budget >= 24000: return "high"
+            if budget >= 10000: return "medium"
+            return "low"
+
+    return CONFIG.get("default_reasoning_effort", "medium")
+
+# ---------------------------------------------------------------------
+# Message & Tool Protocol Adapters: Chat -> Responses
+# ---------------------------------------------------------------------
+def convert_chat_messages_to_responses_input(messages: list) -> list:
+    """Converts OpenAI chat messages format to Responses API input list.
+       Handles plain text, array of content parts, system instructions, and tool results.
+    """
+    responses_input = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        # Flatten content parts if client sends [{'type': 'text', 'text': '...'}]
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") in ("text", "input_text") and "text" in part:
+                        text_parts.append(part["text"])
+                    elif part.get("type") == "image_url":
+                        responses_input.append({"role": role, "content": [part]})
+                        text_parts = None
+                        break
+            if text_parts is not None:
+                content = "\n".join(text_parts)
+
+        # Handle tool call results
+        if role == "tool":
+            responses_input.append({
+                "type": "function_call_output",
+                "call_id": msg.get("tool_call_id", ""),
+                "output": str(content)
+            })
+            continue
+
+        item = {"role": role, "content": content}
+        # If assistant previously called tools
+        if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function", {})
+                responses_input.append({
+                    "type": "function_call",
+                    "id": tc.get("id"),
+                    "call_id": tc.get("id"),
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", "{}")
+                })
+        responses_input.append(item)
+
+    return responses_input
+
+def convert_chat_tools_to_responses_tools(tools: list) -> list:
+    """Converts OpenAI format tools to Responses API format."""
+    out_tools = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") == "function" and "function" in t:
+            fn = t["function"]
+            out_tools.append({
+                "type": "function",
+                "name": fn.get("name"),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {})
+            })
+        else:
+            out_tools.append(t)
+    return out_tools
+
+def build_responses_payload(chat_body: dict) -> dict:
+    """Translates incoming /v1/chat/completions body to /v1/responses format."""
+    model = chat_body.get("model") or CONFIG.get("default_model", "gpt-6.1-sol")
+    
+    # Enforce stream if set in config or requested by client
+    force_stream = CONFIG.get("stream", True)
+    stream = True if force_stream else chat_body.get("stream", False)
+
+    messages = chat_body.get("messages", [])
+    responses_input = convert_chat_messages_to_responses_input(messages)
+    effort = extract_reasoning_effort(chat_body)
+
+    payload = {
+        "model": model,
+        "input": responses_input,
+        "stream": stream,
+        "reasoning": {"effort": effort}
+    }
+
+    if "temperature" in chat_body:
+        payload["temperature"] = chat_body["temperature"]
+    if "top_p" in chat_body:
+        payload["top_p"] = chat_body["top_p"]
+    if "max_tokens" in chat_body:
+        payload["max_output_tokens"] = chat_body["max_tokens"]
+    elif "max_completion_tokens" in chat_body:
+        payload["max_output_tokens"] = chat_body["max_completion_tokens"]
+
+    if "tools" in chat_body and isinstance(chat_body["tools"], list):
+        payload["tools"] = convert_chat_tools_to_responses_tools(chat_body["tools"])
+        if "tool_choice" in chat_body:
+            payload["tool_choice"] = chat_body["tool_choice"]
+
+    return payload
+
+# ---------------------------------------------------------------------
+# Response Adapters: Responses API -> OpenAI Chat Completion
+# ---------------------------------------------------------------------
+def convert_responses_json_to_chat_json(resp_data: dict, model_name: str) -> dict:
+    resp_id = resp_data.get("id") or f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = resp_data.get("created_at") or int(time.time())
+
+    content_text = ""
+    reasoning_text = ""
+    tool_calls = []
+
+    outputs = resp_data.get("output", [])
+    for item in outputs:
+        item_type = item.get("type")
+        if item_type == "message":
+            for part in item.get("content", []):
+                if part.get("type") in ("output_text", "text"):
+                    content_text += part.get("text", "")
+        elif item_type == "reasoning":
+            for part in item.get("summary", []):
+                if part.get("type") in ("summary_text", "text"):
+                    reasoning_text += part.get("text", "")
+        elif item_type == "function_call":
+            tool_calls.append({
+                "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": item.get("name", ""),
+                    "arguments": item.get("arguments", "{}")
+                }
+            })
+
+    message_obj: Dict[str, Any] = {
+        "role": "assistant",
+        "content": content_text
+    }
+    if reasoning_text:
+        message_obj["reasoning_content"] = reasoning_text
+    if tool_calls:
+        message_obj["tool_calls"] = tool_calls
+
+    finish_reason = "tool_calls" if tool_calls else "stop"
+
+    usage = resp_data.get("usage") or {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0
+    }
+
+    return {
+        "id": resp_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": message_obj,
+                "finish_reason": finish_reason
+            }
+        ],
+        "usage": usage
+    }
+
+async def stream_responses_to_chat_sse(
+    response: httpx.Response,
+    model_name: str
+) -> AsyncGenerator[str, None]:
+    """Translates Responses API SSE stream into standard OpenAI chat.completion.chunk SSE stream."""
+    chat_cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created_time = int(time.time())
+
+    active_tool_calls: Dict[int, dict] = {}
+    current_call_index = 0
+
+    init_chunk = {
+        "id": chat_cmpl_id,
+        "object": "chat.completion.chunk",
+        "created": created_time,
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": None
+            }
+        ]
+    }
+    yield f"data: {json.dumps(init_chunk)}\n\n"
+
+    current_event = None
+
+    async for raw_line in response.aiter_lines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("event:"):
+            current_event = line[6:].strip()
+            continue
+
+        if line.startswith("data:"):
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                break
+
+            try:
+                data = json.loads(data_str)
+            except Exception:
+                continue
+
+            event_type = data.get("type") or current_event
+
+            # Text delta
+            if event_type == "response.output_text.delta":
+                delta_text = data.get("delta", "")
+                if delta_text:
+                    chunk = {
+                        "id": chat_cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": delta_text},
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+            # Reasoning text delta
+            elif event_type == "response.reasoning_summary_text.delta":
+                delta_text = data.get("delta", "")
+                if delta_text:
+                    chunk = {
+                        "id": chat_cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "reasoning_content": delta_text,
+                                    "thinking": delta_text
+                                },
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+            # Tool call added
+            elif event_type == "response.output_item.added":
+                item = data.get("item", {})
+                if item.get("type") == "function_call":
+                    out_idx = data.get("output_index", current_call_index)
+                    call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                    fn_name = item.get("name", "")
+                    active_tool_calls[out_idx] = {
+                        "index": current_call_index,
+                        "id": call_id,
+                        "name": fn_name
+                    }
+                    chunk = {
+                        "id": chat_cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": current_call_index,
+                                            "id": call_id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": fn_name,
+                                                "arguments": ""
+                                            }
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    current_call_index += 1
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+            # Tool call argument delta
+            elif event_type == "response.function_call_arguments.delta":
+                arg_delta = data.get("delta", "")
+                out_idx = data.get("output_index", 0)
+                tc_info = active_tool_calls.get(out_idx)
+                tc_index = tc_info["index"] if tc_info else 0
+                chunk = {
+                    "id": chat_cmpl_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": tc_index,
+                                        "function": {"arguments": arg_delta}
+                                    }
+                                ]
+                            },
+                            "finish_reason": None
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+
+            # Response completed
+            elif event_type == "response.completed":
+                finish_reason = "tool_calls" if active_tool_calls else "stop"
+                end_chunk = {
+                    "id": chat_cmpl_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": finish_reason
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(end_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+# ---------------------------------------------------------------------
+# FastAPI Application & Lifespan
+# ---------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=15.0, read=120.0, write=30.0, pool=60.0)) as client:
+        app.state.client = client
+        port = CONFIG.get("port", 5050)
+        print(f"\n=======================================================")
+        print(f"🚀 XingchiAPI Proxy Bridge is RUNNING on http://localhost:{port}")
+        print(f"📡 Upstream: {UPSTREAM_BASE_URL}/responses")
+        print(f"🔑 API Key: {mask_key(CONFIG.get('api_key', ''))}")
+        print(f"⚡ Forced Stream: {CONFIG.get('stream', True)}")
+        print(f"=======================================================\n")
+        yield
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def get_effective_api_key(request: Request) -> str:
+    """Use user Authorization header if valid, otherwise fallback to config.json api_key."""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        user_key = auth_header[7:].strip()
+        if user_key and user_key not in ("sk-dummy", "none", "null", "YOUR_KEY"):
+            return user_key
+    key = CONFIG.get("api_key", "")
+    if key == "YOUR_KEY" or not key:
+        logger.warning("No API key provided in config.json or Authorization header!")
+    return key
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "upstream": UPSTREAM_BASE_URL}
+
+@app.get("/v1/models")
+@app.get("/models")
+async def list_models(request: Request):
+    client: httpx.AsyncClient = app.state.client
+    api_key = get_effective_api_key(request)
+    headers = {
+        **OPENCODE_FINGERPRINT_HEADERS,
+        "Authorization": f"Bearer {api_key}"
+    }
+    try:
+        r = await client.get(f"{UPSTREAM_BASE_URL}/models", headers=headers)
+        return Response(content=r.content, status_code=r.status_code, media_type="application/json")
+    except Exception:
+        return JSONResponse({
+            "object": "list",
+            "data": [{"id": CONFIG.get("default_model", "gpt-6.1-sol"), "object": "model"}]
+        })
+
+# ---------------------------------------------------------------------
+# Primary Chat Completion Endpoint (/v1/chat/completions)
+# ---------------------------------------------------------------------
+@app.post("/v1/chat/completions")
+@app.post("/chat/completions")
+async def chat_completions(request: Request):
+    client: httpx.AsyncClient = app.state.client
+    api_key = get_effective_api_key(request)
+
+    try:
+        raw_body = await request.body()
+        chat_body = json.loads(raw_body)
+    except Exception as e:
+        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}}, status_code=400)
+
+    model_name = chat_body.get("model") or CONFIG.get("default_model", "gpt-6.1-sol")
+    
+    # Check if stream should be enabled
+    force_stream = CONFIG.get("stream", True)
+    is_stream = True if force_stream else chat_body.get("stream", False)
+
+    try:
+        upstream_payload = build_responses_payload(chat_body)
+    except Exception as e:
+        logger.error(f"Payload conversion error: {e}")
+        return JSONResponse({"error": {"message": f"Conversion error: {str(e)}", "type": "proxy_error"}}, status_code=500)
+
+    upstream_headers = {
+        **OPENCODE_FINGERPRINT_HEADERS,
+        "Authorization": f"Bearer {api_key}"
+    }
+    upstream_url = f"{UPSTREAM_BASE_URL}/responses"
+
+    # Streaming handling
+    if is_stream:
+        try:
+            req = client.build_request("POST", upstream_url, headers=upstream_headers, json=upstream_payload)
+            r = await client.send(req, stream=True)
+
+            if r.status_code != 200:
+                err_bytes = await r.aread()
+                return Response(content=err_bytes, status_code=r.status_code, media_type="application/json")
+
+            return StreamingResponse(
+                stream_responses_to_chat_sse(r, model_name),
+                media_type="text/event-stream"
+            )
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            return JSONResponse({"error": {"message": str(e), "type": "proxy_error"}}, status_code=500)
+
+    # Non-streaming handling
+    else:
+        try:
+            r = await client.post(upstream_url, headers=upstream_headers, json=upstream_payload)
+            if r.status_code != 200:
+                return Response(content=r.content, status_code=r.status_code, media_type="application/json")
+
+            resp_json = r.json()
+            chat_response = convert_responses_json_to_chat_json(resp_json, model_name)
+            return JSONResponse(chat_response)
+        except Exception as e:
+            logger.error(f"Request error: {e}")
+            return JSONResponse({"error": {"message": str(e), "type": "proxy_error"}}, status_code=500)
+
+# ---------------------------------------------------------------------
+# Direct Responses Pass-Through Endpoint (/v1/responses)
+# ---------------------------------------------------------------------
+@app.post("/v1/responses")
+@app.post("/responses")
+async def pass_through_responses(request: Request):
+    client: httpx.AsyncClient = app.state.client
+    api_key = get_effective_api_key(request)
+
+    try:
+        body = await request.body()
+        payload = json.loads(body)
+    except Exception:
+        payload = {}
+
+    upstream_headers = {
+        **OPENCODE_FINGERPRINT_HEADERS,
+        "Authorization": f"Bearer {api_key}"
+    }
+    upstream_url = f"{UPSTREAM_BASE_URL}/responses"
+    is_stream = payload.get("stream", False)
+
+    try:
+        if is_stream:
+            req = client.build_request("POST", upstream_url, headers=upstream_headers, json=payload)
+            r = await client.send(req, stream=True)
+
+            async def pass_stream():
+                async for chunk in r.aiter_bytes():
+                    yield chunk
+
+            return StreamingResponse(pass_stream(), media_type="text/event-stream")
+        else:
+            r = await client.post(upstream_url, headers=upstream_headers, json=payload)
+            return Response(content=r.content, status_code=r.status_code, media_type="application/json")
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+if __name__ == "__main__":
+    port = CONFIG.get("port", 5050)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
